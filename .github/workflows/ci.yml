@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/spoolman-mcp-go
+  SPOOLMAN_VERSION: "0.27.1"
+
+jobs:
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  integration:
+    name: Integration (real Spoolman)
+    runs-on: ubuntu-latest
+    services:
+      spoolman:
+        image: ghcr.io/donkie/spoolman:0.27.1
+        ports:
+          - 7912:8000
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Wait for Spoolman
+        run: |
+          for i in $(seq 1 60); do
+            curl -fsS http://localhost:7912/api/v1/health && exit 0
+            sleep 2
+          done
+          echo "Spoolman did not become healthy" && exit 1
+      - name: Integration tests
+        env:
+          SPOOLMAN_TEST_URL: http://localhost:7912
+        run: go test -tags integration -count=1 -v ./internal/tools/
+
+  docker:
+    name: Docker image
+    needs: [test, integration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=edge,branch=main
+            type=sha
+      - name: Build for smoke test (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: spoolman-mcp:smoke
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test image
+        run: |
+          docker image ls spoolman-mcp:smoke --format 'size: {{.Size}}'
+          docker run --rm spoolman-mcp:smoke version
+          docker run -d --name smoke -p 8080:8080 \
+            -e SPOOLMAN_URL=http://127.0.0.1:1 -e MCP_AUTH_TOKEN=ci-smoke-token-0123456789 spoolman-mcp:smoke
+          sleep 3
+          curl -fsS http://localhost:8080/healthz
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/mcp)
+          test "$code" = "401"
+          docker exec smoke /spoolman-mcp healthcheck
+          docker rm -f smoke
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push multi-arch
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          provenance: true
+          sbom: true
+
+  release:
+    name: Release binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, integration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Build binaries
+        run: |
+          set -e
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*}; arch=${target#*/}
+            ext=""; [ "$os" = "windows" ] && ext=".exe"
+            name="spoolman-mcp_${GITHUB_REF_NAME}_${os}_${arch}"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch GOARM=7 go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v} -X main.commit=${GITHUB_SHA}" \
+              -o "dist/${name}${ext}" ./cmd/spoolman-mcp
+          done
+          cd dist && sha256sum * > checksums.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

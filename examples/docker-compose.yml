@@ -1,0 +1,21 @@
+services:
+  spoolman-mcp:
+    image: ghcr.io/virtualben89/spoolman-mcp-go:latest
+    container_name: spoolman-mcp
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      SPOOLMAN_URL: http://spoolman:7912
+      MCP_AUTH_TOKEN_FILE: /run/secrets/mcp_token
+      # READ_ONLY: "true"
+      # ALLOW_DELETE: "false"
+      # TOOL_PREFIX: spoolman_
+    secrets: [mcp_token]
+    ports:
+      - "8080:8080"
+
+secrets:
+  mcp_token:
+    file: ./mcp_token.txt   # e.g. `openssl rand -hex 32 > mcp_token.txt`
