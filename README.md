@@ -15,7 +15,7 @@ Codex, n8n, Hermes, LibreChat, Open WebUI, …) **read and manage** your vendors
   and every delete requires `confirm=true`
 - **Upstream auth** towards Spoolman (Bearer, Basic or custom headers, e.g. Cloudflare Access) for
   instances behind a reverse proxy
-- **Tiny image:** `FROM scratch`, non-root, ~10 MB, `linux/amd64`, `linux/arm64`, `linux/arm/v7`
+- **Tiny image:** `FROM scratch`, non-root, ~14 MB, `linux/amd64`, `linux/arm64`, `linux/arm/v7`
 - Portable tool schemas (no `$ref`, no union types) so strict clients such as Gemini and OpenAI accept them
 
 ## Quick start
