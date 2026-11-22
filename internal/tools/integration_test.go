@@ -201,5 +201,5 @@ func TestIntegrationFullLifecycle(t *testing.T) {
 	ok("delete_vendor", map[string]any{"id": vendor.ID, "confirm": true})
 	ok("delete_extra_field", map[string]any{"entity_type": "spool", "key": "it_dryer", "confirm": true})
 	ok("delete_extra_field", map[string]any{"entity_type": "spool", "key": "it_nozzle", "confirm": true})
-	ok("set_setting", map[string]any{"key": "currency"}) // reset
+	ok("set_setting", map[string]any{"key": "currency", "confirm": true}) // reset
 }

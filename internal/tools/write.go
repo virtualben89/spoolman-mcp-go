@@ -11,8 +11,6 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/virtualben89/spoolman-mcp-go/internal/spoolman"
 )
 
 const extraHelp = "custom extra field values keyed by field key, given as native JSON values (string, number, bool, array); they are encoded for Spoolman automatically. See list_extra_fields."
@@ -146,9 +144,13 @@ type setExtraFieldInput struct {
 }
 
 type setSettingInput struct {
-	Key   string `json:"key" jsonschema:"setting key, e.g. currency"`
-	Value any    `json:"value,omitempty" jsonschema:"new value as native JSON value matching the setting type (e.g. \"EUR\", 5, true); omit or null to reset to default"`
+	Key     string `json:"key" jsonschema:"setting key, e.g. currency (extra field definitions are managed with set_extra_field/delete_extra_field)"`
+	Value   any    `json:"value,omitempty" jsonschema:"new value as native JSON value matching the setting type (e.g. \"EUR\", 5, true); omit or null to reset to default"`
+	Confirm bool   `json:"confirm,omitempty" jsonschema:"must be true to reset a setting to its default (value omitted or null)"`
 }
+
+// tagEntityPaths maps the link_tag/unlink_tag entity enum to constant path prefixes.
+var tagEntityPaths = map[string]string{"spool": "/spool/", "filament": "/filament/"}
 
 type tagLinkInput struct {
 	Entity string  `json:"entity" jsonschema:"what to link the tag to"`
@@ -213,7 +215,7 @@ func (r *Registry) registerWrite() {
 			}
 			return r.send(ctx, http.MethodPost, "/vendor", body)
 		})
-	add(r, toolDef{kind: KindWrite, name: "update_vendor", title: "Update vendor", idempotent: true,
+	add(r, toolDef{kind: KindWrite, name: "update_vendor", title: "Update vendor", destructive: true, idempotent: true,
 		description: "Update selected fields of a vendor. Only given fields change; list fields in clear_fields to empty them. Extra: " + extraHelp,
 		enums:       map[string][]any{"clear_fields": toAny(vendorClearable)}},
 		func(ctx context.Context, in updateVendorInput) (*mcp.CallToolResult, error) {
@@ -238,7 +240,7 @@ func (r *Registry) registerWrite() {
 			}
 			return r.send(ctx, http.MethodPost, "/filament", body)
 		})
-	add(r, toolDef{kind: KindWrite, name: "update_filament", title: "Update filament", idempotent: true,
+	add(r, toolDef{kind: KindWrite, name: "update_filament", title: "Update filament", destructive: true, idempotent: true,
 		description: "Update selected fields of a filament type. Only given fields change; list fields in clear_fields to empty them. Extra: " + extraHelp,
 		enums: map[string][]any{"multi_color_direction": {"coaxial", "longitudinal"},
 			"clear_fields": toAny(filamentClearable)}},
@@ -263,7 +265,7 @@ func (r *Registry) registerWrite() {
 			}
 			return r.send(ctx, http.MethodPost, "/spool", body)
 		})
-	add(r, toolDef{kind: KindWrite, name: "update_spool", title: "Update spool", idempotent: true,
+	add(r, toolDef{kind: KindWrite, name: "update_spool", title: "Update spool", destructive: true, idempotent: true,
 		description: "Update selected fields of a spool, e.g. location, comment, archived, remaining_weight. Only given fields change; list fields in clear_fields to empty them. For consumption prefer use_spool or measure_spool. Extra: " + extraHelp,
 		enums:       map[string][]any{"clear_fields": toAny(spoolClearable)}},
 		func(ctx context.Context, in updateSpoolInput) (*mcp.CallToolResult, error) {
@@ -276,7 +278,7 @@ func (r *Registry) registerWrite() {
 			}
 			return r.send(ctx, http.MethodPatch, "/spool/"+strconv.Itoa(in.ID), body)
 		})
-	add(r, toolDef{kind: KindWrite, name: "use_spool", title: "Consume filament",
+	add(r, toolDef{kind: KindWrite, name: "use_spool", title: "Consume filament", destructive: true,
 		description: "Record filament consumption on a spool, by weight (g) or length (mm). Updates used/remaining weight and first/last used timestamps."},
 		func(ctx context.Context, in useSpoolInput) (*mcp.CallToolResult, error) {
 			if (in.UseWeight == nil) == (in.UseLength == nil) {
@@ -290,25 +292,33 @@ func (r *Registry) registerWrite() {
 			}
 			return r.send(ctx, http.MethodPut, "/spool/"+strconv.Itoa(in.ID)+"/use", body)
 		})
-	add(r, toolDef{kind: KindWrite, name: "measure_spool", title: "Update from scale",
+	add(r, toolDef{kind: KindWrite, name: "measure_spool", title: "Update from scale", destructive: true,
 		description: "Set a spool's remaining filament from its current gross weight on a scale (filament + empty spool). Spoolman subtracts the spool weight."},
 		func(ctx context.Context, in measureSpoolInput) (*mcp.CallToolResult, error) {
 			return r.send(ctx, http.MethodPut, "/spool/"+strconv.Itoa(in.ID)+"/measure", map[string]any{"weight": in.Weight})
 		})
-	add(r, toolDef{kind: KindWrite, name: "rename_location", title: "Rename location", idempotent: true,
+	add(r, toolDef{kind: KindWrite, name: "rename_location", title: "Rename location", destructive: true,
 		description: "Rename a storage location; all spools in it are moved to the new name."},
 		func(ctx context.Context, in renameLocationInput) (*mcp.CallToolResult, error) {
-			return r.send(ctx, http.MethodPatch, "/location/"+spoolman.PathEscape(in.Location), map[string]any{"name": in.NewName})
+			loc, err := seg(in.Location)
+			if err != nil {
+				return nil, err
+			}
+			return r.send(ctx, http.MethodPatch, "/location/"+loc, map[string]any{"name": in.NewName})
 		})
-	add(r, toolDef{kind: KindWrite, name: "rename_spool_field_value", title: "Rename spool field value", idempotent: true,
+	add(r, toolDef{kind: KindWrite, name: "rename_spool_field_value", title: "Rename spool field value", destructive: true,
 		description: "Replace one value of a spool field (location or extra.<key>) on all spools at once, including archived ones."},
 		func(ctx context.Context, in renameFieldValueInput) (*mcp.CallToolResult, error) {
-			return r.send(ctx, http.MethodPatch, "/spool/field/"+spoolman.PathEscape(in.Field),
+			field, err := seg(in.Field)
+			if err != nil {
+				return nil, err
+			}
+			return r.send(ctx, http.MethodPatch, "/spool/field/"+field,
 				map[string]any{"value": in.Value, "new_value": in.NewValue})
 		})
 
 	// fields & settings
-	add(r, toolDef{kind: KindWrite, name: "set_extra_field", title: "Create/update extra field", idempotent: true,
+	add(r, toolDef{kind: KindWrite, name: "set_extra_field", title: "Create/update extra field", destructive: true, idempotent: true,
 		description: "Create or update a custom (extra) field definition for spools, filaments or vendors.",
 		enums: map[string][]any{"entity_type": entityTypes,
 			"field_type": {"text", "integer", "integer_range", "float", "float_range", "datetime", "boolean", "choice"}}},
@@ -333,21 +343,38 @@ func (r *Registry) registerWrite() {
 			if in.Order != nil {
 				body["order"] = *in.Order
 			}
-			return r.send(ctx, http.MethodPost, "/field/"+spoolman.PathEscape(in.EntityType)+"/"+spoolman.PathEscape(in.Key), body)
+			et, err := seg(in.EntityType)
+			if err != nil {
+				return nil, err
+			}
+			key, err := seg(in.Key)
+			if err != nil {
+				return nil, err
+			}
+			return r.send(ctx, http.MethodPost, "/field/"+et+"/"+key, body)
 		})
-	add(r, toolDef{kind: KindWrite, name: "set_setting", title: "Change setting", idempotent: true,
-		description: "Change a Spoolman setting (e.g. currency). Omit value to reset it to the default."},
+	add(r, toolDef{kind: KindWrite, name: "set_setting", title: "Change setting", idempotent: true, destructive: true,
+		description: "Change a Spoolman preference setting (e.g. currency). Omit value and set confirm=true to reset it to the default. Extra field definitions (extra_fields_*) cannot be changed here; use set_extra_field / delete_extra_field."},
 		func(ctx context.Context, in setSettingInput) (*mcp.CallToolResult, error) {
+			key, err := seg(in.Key)
+			if err != nil {
+				return nil, err
+			}
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(in.Key)), "extra_fields") {
+				return nil, errors.New("extra field definitions are managed with set_extra_field / delete_extra_field, not set_setting")
+			}
+			if in.Value == nil && !in.Confirm {
+				return nil, errors.New("refusing to reset the setting to its default: set confirm=true")
+			}
 			// Spoolman expects the body to be a JSON string that itself contains the JSON value.
 			inner := []byte("null")
 			if in.Value != nil {
-				var err error
 				if inner, err = json.Marshal(in.Value); err != nil {
 					return nil, err
 				}
 			}
 			outer, _ := json.Marshal(string(inner))
-			return r.send(ctx, http.MethodPost, "/setting/"+spoolman.PathEscape(in.Key), outer)
+			return r.send(ctx, http.MethodPost, "/setting/"+key, outer)
 		})
 	add(r, toolDef{kind: KindWrite, name: "create_backup", title: "Create backup",
 		description: "Trigger a database backup on the Spoolman server and return its path."},
@@ -364,7 +391,11 @@ func (r *Registry) registerWrite() {
 			if in.Format != nil {
 				body["format"] = *in.Format
 			}
-			return r.send(ctx, http.MethodPost, "/"+in.Entity+"/"+strconv.Itoa(in.ID)+"/tag", body)
+			prefix, ok := tagEntityPaths[in.Entity]
+			if !ok {
+				return nil, fmt.Errorf("invalid entity %q", in.Entity)
+			}
+			return r.send(ctx, http.MethodPost, prefix+strconv.Itoa(in.ID)+"/tag", body)
 		})
 	add(r, toolDef{kind: KindWrite, name: "report_tag_scan", title: "Report tag scan",
 		description: "Report an NFC tag scan to Spoolman and get the matching spool/filament. With create=true an unknown but decodable tag creates a new spool."},
@@ -509,7 +540,15 @@ func (r *Registry) registerDelete() {
 			if !in.Confirm {
 				return nil, errConfirm
 			}
-			return r.send(ctx, http.MethodDelete, "/field/"+spoolman.PathEscape(in.EntityType)+"/"+spoolman.PathEscape(in.Key), nil)
+			et, err := seg(in.EntityType)
+			if err != nil {
+				return nil, err
+			}
+			key, err := seg(in.Key)
+			if err != nil {
+				return nil, err
+			}
+			return r.send(ctx, http.MethodDelete, "/field/"+et+"/"+key, nil)
 		})
 	add(r, toolDef{kind: KindDelete, name: "unlink_tag", title: "Unlink NFC tag",
 		description: "Remove the link between an NFC/RFID tag and a spool or filament. Requires confirm=true.",
@@ -518,6 +557,14 @@ func (r *Registry) registerDelete() {
 			if !in.Confirm {
 				return nil, errConfirm
 			}
-			return r.send(ctx, http.MethodDelete, "/"+in.Entity+"/"+strconv.Itoa(in.ID)+"/tag/"+spoolman.PathEscape(in.UID), nil)
+			prefix, ok := tagEntityPaths[in.Entity]
+			if !ok {
+				return nil, fmt.Errorf("invalid entity %q", in.Entity)
+			}
+			uid, err := seg(in.UID)
+			if err != nil {
+				return nil, err
+			}
+			return r.send(ctx, http.MethodDelete, prefix+strconv.Itoa(in.ID)+"/tag/"+uid, nil)
 		})
 }

@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,7 +26,11 @@ type Options struct {
 	AllowDelete  bool
 	Prefix       string
 	DefaultLimit int
+	// MaxResultBytes caps the text of a single tool result (0 = 4 MiB).
+	MaxResultBytes int
 }
+
+const defaultMaxResultBytes = 4 << 20
 
 // Kind classifies a tool for gating.
 type Kind int
@@ -61,6 +66,7 @@ type toolDef struct {
 	title       string
 	description string
 	idempotent  bool
+	destructive bool             // KindWrite only: the tool overwrites, merges or removes existing data
 	enums       map[string][]any // property name -> allowed values
 }
 
@@ -99,7 +105,7 @@ func add[In any](r *Registry, d toolDef, h func(context.Context, In) (*mcp.CallT
 		ann.ReadOnlyHint = true
 		ann.IdempotentHint = true
 	case KindWrite:
-		ann.DestructiveHint = ptr(false)
+		ann.DestructiveHint = ptr(d.destructive)
 		ann.IdempotentHint = d.idempotent
 	case KindDelete:
 		ann.DestructiveHint = ptr(true)
@@ -119,7 +125,7 @@ func add[In any](r *Registry, d toolDef, h func(context.Context, In) (*mcp.CallT
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		return res, nil, nil
+		return r.capResult(res), nil, nil
 	})
 	r.names = append(r.names, name)
 }
@@ -172,12 +178,38 @@ func jsonResult(raw []byte) *mcp.CallToolResult {
 }
 
 func valueResult(v any) (*mcp.CallToolResult, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false) // avoid \u003c-style blow-up of upstream text
+	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
-	return textResult(string(b)), nil
+	return textResult(strings.TrimSuffix(buf.String(), "\n")), nil
 }
+
+// capResult truncates oversized text content so a single upstream response
+// cannot produce an unbounded tool result.
+func (r *Registry) capResult(res *mcp.CallToolResult) *mcp.CallToolResult {
+	max := r.opts.MaxResultBytes
+	if max <= 0 {
+		max = defaultMaxResultBytes
+	}
+	for _, c := range res.Content {
+		tc, ok := c.(*mcp.TextContent)
+		if !ok || len(tc.Text) <= max {
+			continue
+		}
+		cut := max
+		for cut > 0 && !utf8.RuneStart(tc.Text[cut]) {
+			cut--
+		}
+		tc.Text = tc.Text[:cut] + fmt.Sprintf("\n[truncated: result exceeded %d bytes; use filters, limit/offset or a narrower query]", max)
+	}
+	return res
+}
+
+// seg validates and escapes one upstream path segment.
+func seg(s string) (string, error) { return spoolman.PathSegment(s) }
 
 // listResult wraps a list response with pagination metadata.
 func listResult(resp *spoolman.Response, limit, offset int) (*mcp.CallToolResult, error) {

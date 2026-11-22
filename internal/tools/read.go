@@ -8,8 +8,6 @@ import (
 	"strconv"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/virtualben89/spoolman-mcp-go/internal/spoolman"
 )
 
 const filterHelp = " Text filters are partial and case-insensitive; separate multiple terms with commas, wrap a term in double quotes for an exact match, or pass an empty string to match entries where the field is empty."
@@ -237,7 +235,11 @@ func (r *Registry) registerRead() {
 		description: "List the custom (extra) field definitions for spools, filaments or vendors: key, name, type, unit, choices, default.",
 		enums:       map[string][]any{"entity_type": entityTypes}},
 		func(ctx context.Context, in entityTypeInput) (*mcp.CallToolResult, error) {
-			resp, err := c.Get(ctx, "/field/"+spoolman.PathEscape(in.EntityType), nil)
+			et, err := seg(in.EntityType)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := c.Get(ctx, "/field/"+et, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -248,7 +250,15 @@ func (r *Registry) registerRead() {
 		description: "List the distinct values used for one custom (extra) field.",
 		enums:       map[string][]any{"entity_type": entityTypes}},
 		func(ctx context.Context, in fieldValuesInput) (*mcp.CallToolResult, error) {
-			resp, err := c.Get(ctx, "/field/"+spoolman.PathEscape(in.EntityType)+"/"+spoolman.PathEscape(in.Key)+"/values", nil)
+			et, err := seg(in.EntityType)
+			if err != nil {
+				return nil, err
+			}
+			key, err := seg(in.Key)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := c.Get(ctx, "/field/"+et+"/"+key+"/values", nil)
 			if err != nil {
 				return nil, err
 			}
@@ -260,7 +270,11 @@ func (r *Registry) registerRead() {
 		func(ctx context.Context, in settingsInput) (*mcp.CallToolResult, error) {
 			p := "/setting/"
 			if in.Key != "" {
-				p += spoolman.PathEscape(in.Key)
+				key, err := seg(in.Key)
+				if err != nil {
+					return nil, err
+				}
+				p += key
 			}
 			resp, err := c.Get(ctx, p, nil)
 			if err != nil {
@@ -301,7 +315,11 @@ func (r *Registry) registerRead() {
 			if in.AllowArchived && in.Entity == "spools" {
 				q.Set("allow_archived", "true")
 			}
-			resp, err := c.Get(ctx, "/export/"+spoolman.PathEscape(in.Entity), q)
+			ent, err := seg(in.Entity)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := c.Get(ctx, "/export/"+ent, q)
 			if err != nil {
 				return nil, err
 			}

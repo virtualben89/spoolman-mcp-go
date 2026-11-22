@@ -21,6 +21,9 @@ import (
 // maxResponseBytes caps the size of responses read from Spoolman.
 const maxResponseBytes = 32 << 20
 
+// maxErrorBodyBytes caps how much of an error response is read (only 2000 bytes are shown).
+const maxErrorBodyBytes = 64 << 10
+
 // Options configures a Client.
 type Options struct {
 	BaseURL            string
@@ -77,7 +80,7 @@ func IsNotFound(err error) bool {
 func New(o Options) (*Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	if o.InsecureSkipVerify || o.CAFile != "" {
-		tc := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: o.InsecureSkipVerify} //nolint:gosec // opt-in
+		tc := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: o.InsecureSkipVerify} // #nosec G402 -- explicit operator opt-in (SPOOLMAN_INSECURE_SKIP_VERIFY)
 		if o.CAFile != "" {
 			pem, err := os.ReadFile(o.CAFile)
 			if err != nil {
@@ -102,7 +105,14 @@ func New(o Options) (*Client, error) {
 	}
 	return &Client{
 		base: strings.TrimRight(o.BaseURL, "/") + "/api/v1",
-		http: &http.Client{Timeout: o.Timeout, Transport: tr},
+		http: &http.Client{
+			Timeout:   o.Timeout,
+			Transport: tr,
+			// Never follow redirects: credentials must only go to the configured
+			// origin, and a redirected write could hit a different resource.
+			// A 3xx is surfaced as an APIError instead.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 		opts: o,
 	}, nil
 }
@@ -161,12 +171,23 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		return nil, fmt.Errorf("spoolman %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	limit := int64(maxResponseBytes)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		limit = maxErrorBodyBytes
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading spoolman response: %w", err)
 	}
+	truncated := int64(len(data)) > limit
+	if truncated {
+		data = data[:limit]
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, &APIError{Method: method, Path: path, Status: resp.StatusCode, Body: string(data)}
+	}
+	if truncated {
+		return nil, fmt.Errorf("spoolman %s %s: response exceeds %d bytes", method, path, maxResponseBytes)
 	}
 	total := -1
 	if tc := resp.Header.Get("X-Total-Count"); tc != "" {
@@ -188,5 +209,17 @@ func (c *Client) Health(ctx context.Context) error {
 	return err
 }
 
-// PathEscape escapes a single path segment.
-func PathEscape(s string) string { return url.PathEscape(s) }
+// PathSegment validates and escapes a single path segment. It rejects empty
+// values, dot segments and anything containing a slash or backslash, because
+// such values can make the request resolve to a different resource upstream.
+func PathSegment(s string) (string, error) {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\\") {
+		return "", fmt.Errorf("invalid path segment %q: must not be empty, '.', '..' or contain '/' or '\\'", s)
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("invalid path segment %q: control characters are not allowed", s)
+		}
+	}
+	return url.PathEscape(s), nil
+}

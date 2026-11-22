@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -65,7 +67,7 @@ func healthcheck() int {
 		host = "127.0.0.1"
 	}
 	c := &http.Client{Timeout: 3 * time.Second}
-	resp, err := c.Get("http://" + net.JoinHostPort(host, port) + "/healthz")
+	resp, err := c.Get("http://" + net.JoinHostPort(host, port) + "/healthz") // #nosec G704 -- fixed loopback health probe built from operator config
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -114,14 +116,15 @@ func run() error {
 	}
 
 	toolOpts := tools.Options{
-		ReadOnly:     cfg.ReadOnly,
-		AllowDelete:  cfg.AllowDelete,
-		Prefix:       cfg.ToolPrefix,
-		DefaultLimit: cfg.DefaultLimit,
+		ReadOnly:       cfg.ReadOnly,
+		AllowDelete:    cfg.AllowDelete,
+		Prefix:         cfg.ToolPrefix,
+		DefaultLimit:   cfg.DefaultLimit,
+		MaxResultBytes: cfg.MaxResultBytes,
 	}
 	server, names := NewServer(client, toolOpts, log)
 	log.Info("spoolman-mcp starting", "version", version, "transport", cfg.Transport,
-		"spoolman", cfg.SpoolmanURL, "tools", len(names), "read_only", cfg.ReadOnly, "allow_delete", cfg.AllowDelete && !cfg.ReadOnly)
+		"spoolman", redactURL(cfg.SpoolmanURL), "tools", len(names), "read_only", cfg.ReadOnly, "allow_delete", cfg.AllowDelete && !cfg.ReadOnly)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -173,8 +176,40 @@ func bearerVerifier(tokens []string) auth.TokenVerifier {
 			return nil, auth.ErrInvalidToken
 		}
 		// Static tokens do not expire; give the middleware a rolling expiry.
-		return &auth.TokenInfo{Expiration: time.Now().Add(time.Hour)}, nil
+		// UserID binds Streamable HTTP sessions to the token that created them.
+		return &auth.TokenInfo{Expiration: time.Now().Add(time.Hour), UserID: tokenID(h)}, nil
 	}
+}
+
+// tokenID derives a non-secret identifier from a token hash.
+func tokenID(h [32]byte) string { return "token-" + hex.EncodeToString(h[:6]) }
+
+// redactURL hides a userinfo password in a URL before logging it.
+func redactURL(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "<invalid url>"
+	}
+	return u.Redacted()
+}
+
+// limitConcurrency rejects requests beyond max concurrent in-flight MCP requests
+// (including long-lived SSE streams) with 503.
+func limitConcurrency(max int, next http.Handler) http.Handler {
+	if max <= 0 {
+		return next
+	}
+	sem := make(chan struct{}, max)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "too many concurrent requests", http.StatusServiceUnavailable)
+		}
+	})
 }
 
 func serveHTTP(ctx context.Context, cfg *config.Config, server *mcp.Server, client *spoolman.Client, log *slog.Logger) error {
@@ -186,6 +221,10 @@ func serveHTTP(ctx context.Context, cfg *config.Config, server *mcp.Server, clie
 		Handler:           buildHandler(cfg, server, client, log),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+		// No ReadTimeout/WriteTimeout: SSE responses are long-lived streams.
+		// Request bodies are capped by the SDK (4 MiB) and in-flight requests
+		// by MCP_HTTP_MAX_CONCURRENT.
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -207,10 +246,12 @@ func serveHTTP(ctx context.Context, cfg *config.Config, server *mcp.Server, clie
 func buildHandler(cfg *config.Config, server *mcp.Server, client *spoolman.Client, log *slog.Logger) http.Handler {
 	getServer := func(*http.Request) *mcp.Server { return server }
 
-	protect := func(h http.Handler) http.Handler { return h }
+	authn := func(h http.Handler) http.Handler { return h }
 	if len(cfg.AuthTokens) > 0 {
-		protect = auth.RequireBearerToken(bearerVerifier(cfg.AuthTokens), &auth.RequireBearerTokenOptions{})
+		authn = auth.RequireBearerToken(bearerVerifier(cfg.AuthTokens), &auth.RequireBearerTokenOptions{})
 	}
+	// Auth first, then the concurrency limit, so unauthenticated clients cannot use up slots.
+	protect := func(h http.Handler) http.Handler { return authn(limitConcurrency(cfg.HTTPMaxConcurrent, h)) }
 
 	mux := http.NewServeMux()
 	streamable := mcp.NewStreamableHTTPHandler(getServer, &mcp.StreamableHTTPOptions{
@@ -276,7 +317,11 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 		if sw.status == http.StatusUnauthorized || sw.status == http.StatusForbidden {
 			lvl = slog.LevelWarn
 		}
-		log.Log(r.Context(), lvl, "http", "method", r.Method, "path", r.URL.Path, "status", sw.status,
+		path := r.URL.Path
+		if len(path) > 200 {
+			path = path[:200] + "…"
+		}
+		log.Log(r.Context(), lvl, "http", "method", r.Method, "path", path, "status", sw.status,
 			"remote", r.RemoteAddr, "duration", time.Since(start).Round(time.Millisecond))
 	})
 }

@@ -14,7 +14,8 @@ services:
       # TOOL_PREFIX: spoolman_
     secrets: [mcp_token]
     ports:
-      - "8080:8080"
+      # Publish on localhost only and put a TLS reverse proxy (Traefik/Caddy) in front.
+      - "127.0.0.1:8080:8080"
 
 secrets:
   mcp_token:

@@ -23,9 +23,11 @@ Codex, n8n, Hermes, LibreChat, Open WebUI, …) **read and manage** your vendors
 ### Docker (HTTP)
 
 ```bash
-docker run -d --name spoolman-mcp -p 8080:8080 \
+openssl rand -hex 32 > mcp_token.txt && chmod 600 mcp_token.txt
+docker run -d --name spoolman-mcp -p 127.0.0.1:8080:8080 \
   -e SPOOLMAN_URL=http://spoolman:7912 \
-  -e MCP_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -e MCP_AUTH_TOKEN_FILE=/run/secrets/mcp_token \
+  -v "$PWD/mcp_token.txt:/run/secrets/mcp_token:ro" \
   ghcr.io/virtualben89/spoolman-mcp-go:latest
 ```
 
@@ -73,17 +75,28 @@ Secrets are read from env only; every secret also supports a `*_FILE` variant (D
 | `MCP_HTTP_JSON_RESPONSE` | `false` | Reply with `application/json` instead of SSE streams |
 | `MCP_HTTP_SESSION_TIMEOUT` | `30m` | Close idle sessions after this duration (`0` = never) |
 | `READ_ONLY` | `false` | Only expose read tools |
-| `ALLOW_DELETE` | `true` | Expose delete tools (they still require `confirm=true`) |
+| `ALLOW_DELETE` | `true` | Expose delete tools (they still require `confirm=true`). Default kept for compatibility; set `false` if agents should never delete |
 | `TOOL_PREFIX` | – | Prefix for tool names, e.g. `spoolman_` for clients without namespacing |
 | `DEFAULT_LIMIT` | `50` | Default page size of list tools (`0` = unlimited) |
+| `MAX_RESULT_BYTES` | `4194304` | Maximum size of one tool result; longer results are truncated with a hint |
+| `MCP_HTTP_MAX_CONCURRENT` | `64` | Maximum concurrent authenticated MCP HTTP requests/SSE streams (`0` = unlimited) |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `text` | `debug…error` / `text` or `json` (always logged to stderr) |
+
+Boolean variables accept `true/false`, `1/0`, `yes/no` and `on/off`; any other value is a startup error
+(so a typo can never silently leave write or delete tools enabled).
 
 HTTP endpoints: `/mcp` (+ `/sse`) require the bearer token; `/healthz` (liveness) and `/readyz`
 (checks Spoolman) are public. The image contains a `healthcheck` subcommand used by Docker's `HEALTHCHECK`.
 
-> **Security note:** the token protects the MCP endpoint, but it travels in plain text over HTTP.
-> Put the server behind TLS (e.g. Traefik/Caddy) or keep it on a trusted network/VPN.
-> stdio has no network exposure and therefore no token.
+> **Security notes**
+> - The token protects the MCP endpoint, but it travels in plain text over HTTP. Put the server behind
+>   TLS (e.g. Traefik/Caddy) or keep it on a trusted network/VPN. stdio has no network exposure and no token.
+> - Prefer `*_FILE` variables / Docker secrets over plain env vars for tokens.
+> - Streamable HTTP sessions are bound to the token that created them.
+> - The server never follows HTTP redirects from Spoolman, so upstream credentials only go to `SPOOLMAN_URL`.
+>   Credentials embedded in `SPOOLMAN_URL` (`user:pass@`) are moved into Basic auth and never logged.
+> - Tools that overwrite, merge or reset data are annotated `destructiveHint: true`; configure your MCP client
+>   to ask before running them. Path arguments (tag UIDs, setting keys, …) containing `/`, `.` or `..` are rejected.
 
 ## Client configuration
 
@@ -218,7 +231,17 @@ Notes for agents:
 - `extra` values are passed as native JSON values and encoded for Spoolman automatically.
 - List tools return `{total, count, offset, limit, has_more, items}`.
 - All tools carry MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) so clients
-  can auto-approve reads and ask before writes.
+  can auto-approve reads and ask before writes. `set_setting` resets need `confirm=true`, and extra field
+  definitions can only be changed with `set_extra_field` / `delete_extra_field`.
+
+## Verifying releases
+
+Release binaries and container images carry signed GitHub build provenance (Sigstore):
+
+```bash
+gh attestation verify spoolman-mcp_v0.1.2_linux_amd64 -R virtualben89/spoolman-mcp-go
+gh attestation verify oci://ghcr.io/virtualben89/spoolman-mcp-go:0.1.2 -R virtualben89/spoolman-mcp-go
+```
 
 ## Development
 
@@ -230,7 +253,8 @@ SPOOLMAN_TEST_URL=http://localhost:7912 go test -tags integration ./internal/too
 ```
 
 CI runs unit tests, the integration suite against a real Spoolman service container, an image smoke
-test, and publishes multi-arch images to GHCR (`edge` from `main`, semver + `latest` from tags).
+test, and publishes multi-arch images to GHCR (`edge` from `main`, semver from tags, `latest` only from
+non-prerelease tags). Actions and base images are pinned by SHA/digest and kept current by Dependabot.
 
 ## License
 
