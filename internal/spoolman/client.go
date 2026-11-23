@@ -108,9 +108,9 @@ func New(o Options) (*Client, error) {
 		http: &http.Client{
 			Timeout:   o.Timeout,
 			Transport: tr,
-			// Never follow redirects: credentials must only go to the configured
-			// origin, and a redirected write could hit a different resource.
-			// A 3xx is surfaced as an APIError instead.
+			// Never follow redirects: credentials (Authorization and custom headers)
+			// must only ever reach the configured origin, and a redirected write
+			// could hit a different resource. A 3xx is surfaced as an APIError.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		opts: o,
@@ -182,6 +182,10 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	truncated := int64(len(data)) > limit
 	if truncated {
 		data = data[:limit]
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		return nil, &APIError{Method: method, Path: path, Status: resp.StatusCode,
+			Body: "redirect not followed (credentials are only sent to the configured URL); point SPOOLMAN_URL at the final Spoolman address"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, &APIError{Method: method, Path: path, Status: resp.StatusCode, Body: string(data)}
