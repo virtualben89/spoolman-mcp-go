@@ -2,6 +2,7 @@ package spoolman
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,32 +11,45 @@ import (
 	"testing"
 )
 
-// Regression: the client must not follow redirects (credential forwarding,
-// redirected deletes resolving onto other resources).
+// Regression: credentials must never follow a redirect to another origin
+// (or be downgraded to plain HTTP), for any auth type and any 3xx status.
 func TestNoRedirectFollow(t *testing.T) {
 	var hits atomic.Int32
-	var gotSecret atomic.Value
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var leaked atomic.Bool
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
-		gotSecret.Store(r.Header.Get("CF-Access-Client-Secret") + "|" + r.Header.Get("Authorization"))
+		if r.Header.Get("CF-Access-Client-Secret") != "" || r.Header.Get("Authorization") != "" {
+			leaked.Store(true)
+		}
 		_, _ = io.WriteString(w, `{}`)
 	}))
-	defer target.Close()
-	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
-		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, strings.Replace(target.URL, "127.0.0.1", "localhost", 1)+"/leak", code)
+	defer sink.Close()
+	target := strings.Replace(sink.URL, "127.0.0.1", "localhost", 1)
+
+	for _, code := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target+"/leak", code)
 		}))
-		c, _ := New(Options{BaseURL: origin.URL, BearerToken: "bearer-secret", Headers: map[string]string{"CF-Access-Client-Secret": "cf-secret"}})
-		_, err := c.Do(context.Background(), http.MethodDelete, "/spool/1/tag/x", nil, nil)
-		origin.Close()
-		var ae *APIError
-		if err == nil || !strings.Contains(err.Error(), "HTTP 3") {
-			t.Errorf("%d: expected 3xx APIError, got %v", code, err)
+		for _, o := range []Options{
+			{BaseURL: up.URL, BearerToken: "dummy-bearer", Headers: map[string]string{"CF-Access-Client-Secret": "dummy-key"}},
+			{BaseURL: up.URL, BasicUser: "u", BasicPassword: "dummy-pass"},
+		} {
+			c, err := New(o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range []string{http.MethodGet, http.MethodDelete} {
+				_, err = c.Do(context.Background(), m, "/spool/1/tag/x", nil, nil)
+				var ae *APIError
+				if !errors.As(err, &ae) || ae.Status != code || !strings.Contains(err.Error(), "redirect not followed") {
+					t.Errorf("%d %s: expected redirect APIError, got %v", code, m, err)
+				}
+			}
 		}
-		_ = ae
+		up.Close()
 	}
-	if hits.Load() != 0 {
-		t.Fatalf("redirect target was contacted %d times, headers %v", hits.Load(), gotSecret.Load())
+	if hits.Load() != 0 || leaked.Load() {
+		t.Fatalf("redirect target contacted %d times (credentials leaked: %v)", hits.Load(), leaked.Load())
 	}
 }
 
