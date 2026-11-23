@@ -256,6 +256,13 @@ CI runs unit tests, the integration suite against a real Spoolman service contai
 test, and publishes multi-arch images to GHCR (`edge` from `main`, semver from tags, `latest` only from
 non-prerelease tags). Actions and base images are pinned by SHA/digest and kept current by Dependabot.
 
+## Releasing
+
+1. Move the `[Unreleased]` entries in `CHANGELOG.md` to a new `## [X.Y.Z] - YYYY-MM-DD` section and add
+   its compare link at the bottom.
+2. Tag `vX.Y.Z` and push the tag. CI fails if the changelog has no entry for the tag and uses that
+   section as the GitHub release notes (`scripts/release-notes.sh`).
+
 ## License
 
 MIT
